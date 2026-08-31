@@ -484,6 +484,8 @@ class TrainingInput(TypedDict, total=False):
     rewards: Optional[Float[torch.Tensor, "batch_size response_len"]]  # env reward, typically only on the last token
     rollout_logprobs: Optional[Float[torch.Tensor, "batch_size response_len"]]  # sampling policy; off-policy corr.
     rollout_expert_indices: Optional[Integer[torch.Tensor, "batch_size seq_len layer_num topk"]]  # MoE router replay
+    teacher_values: Optional[Float[torch.Tensor, "batch_size response_len width"]]  # teacher logits
+    teacher_indices: Optional[Integer[torch.Tensor, "batch_size response_len width"]]  # their vocab ids
     router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route (skip in replay)
     pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
     image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors

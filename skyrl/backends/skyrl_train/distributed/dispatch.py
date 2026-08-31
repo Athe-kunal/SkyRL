@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import ray
 import torch
@@ -292,11 +292,15 @@ class WorkerOutput:
             SFT path).
         metrics: Scalar metrics (loss, lr, response_length, ...). Already
             all-reduced across DP ranks by the worker.
+        tensors: Optional whole-batch tensors, concatenated along dim 0 across DP
+            ranks. For per-token data too wide to serialize per sample as Python
+            lists (e.g. the distillation teacher's top-k).
     """
 
     loss_fn_output_type: str = "scalar"
     loss_fn_outputs: List[Dict[str, Any]] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
+    tensors: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def cat(cls, actor_infos: List[ActorInfo], shards: List["WorkerOutput"]) -> "WorkerOutput":
@@ -323,6 +327,11 @@ class WorkerOutput:
             # metrics are already all-reduced across DP within each worker, so
             # taking rank 0's dict (rather than re-aggregating) is correct.
             metrics=dict(ordered[0].metrics),
+            tensors=(
+                {k: torch.cat([s.tensors[k] for s in ordered], dim=0) for k in ordered[0].tensors}
+                if ordered[0].tensors
+                else None
+            ),
         )
 
 

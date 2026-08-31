@@ -166,7 +166,7 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
     # Validate training batch size is larger than the least common multiple of the DP sizes of policy (and ref if used).
     lcm_dp_size = policy_dp_size
 
-    use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+    use_ref_model = cfg.trainer.algorithm.needs_ref_model
     if use_ref_model:
         ref_world_size = cfg.trainer.placement.ref_num_nodes * cfg.trainer.placement.ref_num_gpus_per_node
         if cfg.trainer.strategy == "megatron":
@@ -313,7 +313,25 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     assert not (
         cfg.trainer.algorithm.use_kl_in_reward and cfg.trainer.algorithm.use_kl_loss
     ), "use_kl_in_reward and use_kl_loss should be mutually exclusive"
-    use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+    use_ref_model = cfg.trainer.algorithm.needs_ref_model
+
+    distillation = cfg.trainer.algorithm.distillation
+    if distillation.enabled:
+        assert (
+            cfg.trainer.ref.model.path and cfg.trainer.ref.model.path != cfg.trainer.policy.model.path
+        ), "distillation needs a teacher different from the student: set `trainer.ref.model.path`"
+        assert not (
+            cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+        ), "distillation replaces the sampled-token KL: set use_kl_loss=false and use_kl_in_reward=false"
+        if distillation.topk == 0:
+            assert cfg.trainer.strategy == "fsdp", "full-vocab distillation is only supported on fsdp"
+            assert (
+                not cfg.trainer.placement.colocate_all and not cfg.trainer.placement.colocate_policy_ref
+            ), "full-vocab distillation needs the ref resident: set both colocate flags false"
+        assert not cfg.trainer.remove_microbatch_padding, "distillation needs `trainer.remove_microbatch_padding=false`"
+        assert (
+            cfg.trainer.policy.sequence_parallel_size == 1 and cfg.trainer.ref.sequence_parallel_size == 1
+        ), "distillation needs `sequence_parallel_size=1` for policy and ref"
 
     if cfg.trainer.policy.language_model_only:
         assert (

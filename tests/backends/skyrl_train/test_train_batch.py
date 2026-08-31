@@ -554,6 +554,8 @@ EXPECTED_TRAINING_INPUT_FIELDS = {
     "router_padding_mask",
     "pixel_values",
     "image_grid_thw",
+    "teacher_values",
+    "teacher_indices",
 }
 
 
@@ -580,6 +582,8 @@ def _make_full_training_batch(batch_size: int = 4, seq_len: int = 5) -> Training
         "router_padding_mask": torch.zeros((batch_size, seq_len), dtype=torch.bool),
         "pixel_values": TensorList([torch.randn(i + 1, 3) for i in range(batch_size)]),  # batch_size * (i + 1) * 3
         "image_grid_thw": TensorList([torch.tensor([[1, 2, 3]]) for _ in range(batch_size)]),  # batch_size * 1 * 3
+        "teacher_values": torch.randn(batch_size, seq_len, 4),
+        "teacher_indices": torch.randint(0, 8, (batch_size, seq_len, 4), dtype=torch.long),
     }
     batch = TrainingInputBatch(data)
     batch.metadata = {

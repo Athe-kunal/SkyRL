@@ -3,7 +3,7 @@ import logging
 import os
 import socket
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from ctypes import CDLL, POINTER, Structure, c_char_p, c_int, c_ulong, c_void_p
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Type
@@ -24,6 +24,12 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel
 
+from skyrl.backends.skyrl_train.distillation.kl import kl_loss as distillation_kl
+from skyrl.backends.skyrl_train.distillation.teacher_head import (
+    TeacherHead,
+    capture_hidden_states,
+    extract_lm_head,
+)
 from skyrl.backends.skyrl_train.distributed.dispatch import (
     ActorInfo,
     Dispatch,
@@ -871,6 +877,11 @@ class PolicyWorkerBase(Worker):
         self.record_memory: bool = False
         self.mesh_rank: MeshRank = None
         self.policy_loss_fn: Callable = PolicyLossRegistry.get(self.cfg.algorithm.policy_loss_type)
+        self.teacher_head: Optional[TeacherHead] = None
+
+    def set_teacher_head(self, weight: torch.Tensor) -> None:
+        self.teacher_head = TeacherHead(weight).to(torch.cuda.current_device())
+        logger.info(f"[distill] teacher head on policy rank: {tuple(self.teacher_head.weight.shape)}")
 
     def forward_backward(
         self,
@@ -1112,6 +1123,21 @@ class PolicyWorkerBase(Worker):
                 kl_loss = torch.tensor(0.0)
             kl_loss_term = kl_loss * self.cfg.algorithm.kl_loss_coef
 
+            distillation = self.cfg.algorithm.distillation
+            if distillation.enabled and experience.teacher_values is not None:
+                distill_loss = distillation_kl(
+                    output["logits"][:, -num_actions - 1 : -1],
+                    experience.teacher_values,
+                    loss_mask,
+                    reverse=distillation.reverse,
+                    teacher_indices=experience.teacher_indices,
+                    teacher_head=self.teacher_head,
+                    chunk_size=distillation.chunk_size,
+                )
+            else:
+                distill_loss = torch.tensor(0.0)
+            distill_loss_term = distill_loss * distillation.coef
+
             # DP all-reduce averages gradients, but policy losses are pre-scaled sums
             # (see `apply_loss_reduction_to_advantages_minibatch`), so we multiply by
             # dp_size to recover the correct sum reduction across workers.
@@ -1119,7 +1145,10 @@ class PolicyWorkerBase(Worker):
 
             # NOTE: The KL and entropy loss terms are not pre-scaled,
             # so we just average them across microbatches and DP workers.
-            loss = policy_loss * grad_sum_correction_factor + (kl_loss_term - entropy_loss_term) * microbatch_weight
+            loss = (
+                policy_loss * grad_sum_correction_factor
+                + (kl_loss_term - entropy_loss_term + distill_loss_term) * microbatch_weight
+            )
             unscaled_loss = loss / grad_sum_correction_factor
             self.strategy.backward(loss, self.model, self.optimizer)
 
@@ -1155,6 +1184,8 @@ class PolicyWorkerBase(Worker):
                 status["loss_metrics/" + k] = v
             if self.cfg.algorithm.use_kl_loss:
                 status["policy_kl"] = kl_loss.item()
+            if distillation.enabled:
+                status["distillation_kl"] = distill_loss.item()
             status.update(
                 compute_minibatch_rollout_logprob_diff_metrics(action_log_probs, rollout_action_logprobs, loss_mask)
             )
@@ -1625,6 +1656,10 @@ class RefWorkerBase(Worker):
         self.optimizer = None
         self.scheduler = None
 
+    def get_teacher_lm_head(self) -> torch.Tensor:
+        """Collective under FSDP: every ref rank must call this."""
+        return extract_lm_head(self.model)
+
     def forward(self, data: TrainingInputBatch) -> WorkerOutput:
         """Run inference forward pass.
 
@@ -1645,7 +1680,10 @@ class RefWorkerBase(Worker):
             output = output.to("cpu")
         row_tensor = output["output"]
         loss_fn_outputs = [{"logprobs": row_tensor[i].tolist()} for i in range(row_tensor.shape[0])]
-        return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
+        # Teacher tensors stay tensors: as Python lists a [response_len, k] entry per sample would
+        # dominate serialization.
+        teacher_tensors = {k: output[k] for k in ("teacher_values", "teacher_indices") if k in output}
+        return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={}, tensors=teacher_tensors or None)
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         device = torch.cuda.current_device()
@@ -1655,18 +1693,33 @@ class RefWorkerBase(Worker):
         attention_mask = micro_batch["attention_mask"]
         pixel_values = micro_batch.get("pixel_values", None)
         image_grid_thw = micro_batch.get("image_grid_thw", None)
-        with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
-            log_probs = self.model(
+        teacher_topk = self.cfg.algorithm.distillation.topk if self.cfg.algorithm.distillation.enabled else 0
+        distillation = self.cfg.algorithm.distillation
+        # Full-vocab distillation ships hidden states instead of logits: hidden_size per token
+        # rather than vocab_size, projected back through the teacher's head on the policy rank.
+        capture = capture_hidden_states(self.model) if distillation.enabled and not teacher_topk else nullcontext()
+        with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"), capture as hidden:
+            result = self.model(
                 sequences,
                 response_length,
                 attention_mask,
                 return_output=False,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
+                teacher_topk=teacher_topk,
             )
-        log_probs = log_probs.to("cpu")
-        output = TrainingOutputBatch(
-            {"output": log_probs},
-        )
+        tensors = {}
+        # Align with the response window the loss slices out of the student's logits.
+        response = slice(-response_length - 1, -1)
+        if teacher_topk:
+            log_probs, topk_values, topk_indices = result
+            tensors["teacher_values"] = topk_values[:, response].to("cpu")
+            tensors["teacher_indices"] = topk_indices[:, response].to("cpu")
+        else:
+            log_probs = result
+            if hidden is not None:
+                tensors["teacher_values"] = hidden[0][:, response].to("cpu")
+        tensors["output"] = log_probs.to("cpu")
+        output = TrainingOutputBatch(tensors)
         output.metadata = micro_batch.metadata
         return output

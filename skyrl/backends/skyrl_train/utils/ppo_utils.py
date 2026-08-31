@@ -455,6 +455,7 @@ class PolicyLossType(StrEnum):
     CROSS_ENTROPY = "cross_entropy"
     IMPORTANCE_SAMPLING = "importance_sampling"
     DPPO = "dppo"
+    NONE = "none"
 
 
 # Losses that optimize against rollout logprobs, so the "old" logprobs forward pass can be
@@ -508,6 +509,7 @@ class PolicyLossRegistry(BaseFunctionRegistry):
             "importance_sampling": [PolicyLossType.IMPORTANCE_SAMPLING, importance_sampling_loss],
             "dppo": [PolicyLossType.DPPO, dppo_policy_loss],
             "rollout_is": [PolicyLossType.ROLLOUT_IS, rollout_is_policy_loss],
+            "none": [PolicyLossType.NONE, none_policy_loss],
         }
 
         for pl_name, (pl_type, pl_func) in pl_types.items():
@@ -1090,6 +1092,20 @@ def cross_entropy_loss(
 
     # No clipping in cross-entropy loss
     return loss, {"clip_ratio": 0.0}
+
+
+@register_policy_loss(PolicyLossType.NONE)
+def none_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    config: AlgorithmConfig,
+    loss_mask: Optional[torch.Tensor] = None,
+    rollout_logprobs: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, dict[str, float]]:
+    """No policy-gradient term, for objectives carried entirely by an auxiliary loss (e.g. pure
+    distillation). The advantages, and any environment reward behind them, are unused."""
+    return torch.zeros((), device=log_probs.device, dtype=log_probs.dtype), {}
 
 
 @register_policy_loss(PolicyLossType.IMPORTANCE_SAMPLING)

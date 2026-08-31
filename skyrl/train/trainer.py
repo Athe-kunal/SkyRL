@@ -655,7 +655,7 @@ class RayPPOTrainer:
         cfg = self.cfg
         pg = None
 
-        use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
+        use_ref_model = cfg.trainer.algorithm.needs_ref_model
 
         if cfg.trainer.placement.colocate_all:
             num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
@@ -850,7 +850,21 @@ class RayPPOTrainer:
         if self.colocate_all:
             self.dispatch.mark_all_offloaded()
 
+        self._init_teacher_head()
+
         logger.info("init policy/ref/critic models done")
+
+    def _init_teacher_head(self):
+        """Move the teacher's unembedding onto the policy ranks for full-vocab distillation."""
+        distillation = self.cfg.trainer.algorithm.distillation
+        if not distillation.enabled or distillation.topk:
+            return
+        if self.ref_model is None:
+            raise ValueError("distillation needs a teacher: set trainer.ref.model.path")
+        if self.colocate_all:
+            logger.info("[distill] `colocate_all` evicts the ref, so hidden states must be buffered per batch")
+        weights = ray.get(self.ref_model.async_run_ray_method("pass_through", "get_teacher_lm_head"))
+        ray.get(self.policy_model.async_run_ray_method("pass_through", "set_teacher_head", weights[0]))
 
     def init_weight_sync_state(self):
         """
@@ -1342,6 +1356,7 @@ class RayPPOTrainer:
         values = None
         base_log_probs = None
         action_log_probs = None
+        teacher_tensors = None
 
         # Critic forward (dispatch handles offload/backload automatically)
         if self.has_critic:
@@ -1355,9 +1370,9 @@ class RayPPOTrainer:
         # Ref forward. The ref model is not trained, so there is no forward_backward to match
         # its packing against -> always a single full-batch forward (boundaries=None).
         if self.ref_model is not None:
-            base_log_probs = self._execute_forward_pass(
-                "ref", data_fwd_pass, key="logprobs", mini_batch_boundaries=None
-            )
+            ref_output = self.dispatch.forward("ref", data_fwd_pass)
+            base_log_probs = loss_fn_outputs_to_tensor(ref_output.loss_fn_outputs, key="logprobs")
+            teacher_tensors = ref_output.tensors
             self.dispatch.empty_cache("ref")
 
         # Policy forward. Skipped for losses that optimize against rollout logprobs (see
@@ -1382,6 +1397,9 @@ class RayPPOTrainer:
         values = values[: len(sequences_all)] if values is not None else None
 
         training_input["base_action_log_probs"] = base_log_probs
+        if teacher_tensors:
+            for key, tensor in teacher_tensors.items():
+                training_input[key] = tensor[: len(sequences_all)]
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
 

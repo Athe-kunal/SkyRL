@@ -78,6 +78,9 @@ class Experience:
     # Per-row sub-sequence lengths for sequence packing (one 1-D int tensor per
     # packed row); ``None`` when packing is off.
     sub_seq_lengths: Optional[TensorList] = None
+    # `width` is k for top-k distillation, or vocab_size when teacher_indices is None.
+    teacher_values: Optional[Float[torch.Tensor, "batch response_len width"]] = None
+    teacher_indices: Optional[Integer[torch.Tensor, "batch response_len width"]] = None
 
     @torch.no_grad()
     def to_device(self, device: torch.device) -> None:
@@ -110,6 +113,10 @@ class Experience:
             self.image_grid_thw = self.image_grid_thw.to(device)
         if self.sub_seq_lengths is not None:
             self.sub_seq_lengths = self.sub_seq_lengths.to(device)
+        if self.teacher_values is not None:
+            self.teacher_values = to(self.teacher_values, device)
+        if self.teacher_indices is not None:
+            self.teacher_indices = to(self.teacher_indices, device)
 
     def pin_memory(self):
         self.sequences = pin_memory(self.sequences)

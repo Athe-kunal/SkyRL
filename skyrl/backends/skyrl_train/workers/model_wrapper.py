@@ -250,8 +250,13 @@ class HFModelWrapper(nn.Module):
         pixel_values: Optional[TensorList] = None,
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
+        teacher_topk: int = 0,
     ) -> torch.Tensor:
-        """Returns action log probs"""
+        """Returns action log probs.
+
+        With ``teacher_topk > 0``, also returns the top-k logits and their vocab indices for
+        distillation, taken before the logits are reduced away.
+        """
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
@@ -333,6 +338,10 @@ class HFModelWrapper(nn.Module):
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
 
+        topk_values, topk_indices = None, None
+        if teacher_topk:
+            topk_values, topk_indices = logits_BSV.detach().topk(teacher_topk, dim=-1)
+
         # NOTE: this is slightly inaccurate with sample packing because last token from nth seq -> first token of n+1th seq loss is added.
         log_probs = logprobs_from_logits(
             logits_BSV,
@@ -392,6 +401,8 @@ class HFModelWrapper(nn.Module):
                 num_actions = np.array(num_actions)
         action_log_probs = log_probs[:, -num_actions - 1 : -1]
 
+        if teacher_topk:
+            return action_log_probs, topk_values, topk_indices
         if return_output:
             return (action_log_probs, output)
         else:

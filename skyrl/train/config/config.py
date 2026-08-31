@@ -821,6 +821,22 @@ class OffPolicyCorrectionConfig(BaseConfig):
 
 
 @dataclass
+class DistillationConfig(BaseConfig):
+    """On-policy distillation against ``trainer.ref`` as teacher."""
+
+    enabled: bool = False
+    reverse: bool = True
+    """``KL(student || teacher)`` when True, ``KL(teacher || student)`` when False."""
+    topk: int = 0
+    """Distill only the teacher's top-k tokens. ``0`` uses the full vocabulary, which ships teacher
+    hidden states and hosts the teacher's LM head on the policy ranks."""
+    coef: float = 1.0
+    chunk_size: Optional[int] = None
+    """Split the sequence into chunks of this size when computing the loss, to bound peak memory.
+    Needed for the full-vocab path, where teacher logits are otherwise materialized whole."""
+
+
+@dataclass
 class AlgorithmConfig(BaseConfig):
     advantage_estimator: str = "grpo"
     """``"grpo"``, ``"gae"``, ``"rloo"``, ``"reinforce++"``, or custom via ``AdvantageEstimatorRegistry``."""
@@ -852,6 +868,12 @@ class AlgorithmConfig(BaseConfig):
     """Normalize advantages by the (global) training-batch mean and standard deviation."""
     value_head_prefix: str = "value_head"
     """Name used to identify the value head in the critic model."""
+    distillation: DistillationConfig = field(default_factory=DistillationConfig)
+
+    @property
+    def needs_ref_model(self) -> bool:
+        return self.use_kl_loss or self.use_kl_in_reward or self.distillation.enabled
+
     policy_loss_type: str = "regular"
     """Type of policy loss to use, or custom via ``PolicyLossRegistry``:
 
