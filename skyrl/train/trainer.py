@@ -857,7 +857,7 @@ class RayPPOTrainer:
     def _init_teacher_head(self):
         """Move the teacher's unembedding onto the policy ranks for full-vocab distillation."""
         distillation = self.cfg.trainer.algorithm.distillation
-        if not distillation.enabled or distillation.topk:
+        if not distillation.enabled or distillation.topk or not distillation.teacher_unembedding:
             return
         if self.ref_model is None:
             raise ValueError("distillation needs a teacher: set trainer.ref.model.path")

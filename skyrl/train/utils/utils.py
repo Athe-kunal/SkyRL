@@ -323,11 +323,16 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         assert not (
             cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
         ), "distillation replaces the sampled-token KL: set use_kl_loss=false and use_kl_in_reward=false"
-        if distillation.topk == 0:
+        assert distillation.topk is None or distillation.topk > 0, "`distillation.topk` must be positive or None"
+        if distillation.topk is None:
             assert cfg.trainer.strategy == "fsdp", "full-vocab distillation is only supported on fsdp"
             assert (
                 not cfg.trainer.placement.colocate_all and not cfg.trainer.placement.colocate_policy_ref
             ), "full-vocab distillation needs the ref resident: set both colocate flags false"
+        else:
+            assert (
+                not distillation.teacher_unembedding
+            ), "`distillation.teacher_unembedding` applies to the full-vocab path: unset `distillation.topk`"
         assert not cfg.trainer.remove_microbatch_padding, "distillation needs `trainer.remove_microbatch_padding=false`"
         assert (
             cfg.trainer.policy.sequence_parallel_size == 1 and cfg.trainer.ref.sequence_parallel_size == 1

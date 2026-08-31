@@ -24,12 +24,6 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedModel
 
-from skyrl.backends.skyrl_train.distillation.kl import kl_loss as distillation_kl
-from skyrl.backends.skyrl_train.distillation.teacher_head import (
-    TeacherHead,
-    capture_hidden_states,
-    extract_lm_head,
-)
 from skyrl.backends.skyrl_train.distributed.dispatch import (
     ActorInfo,
     Dispatch,
@@ -45,6 +39,14 @@ from skyrl.backends.skyrl_train.distributed.ulysses import (
 from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
     TrainingOutputBatch,
+)
+from skyrl.backends.skyrl_train.utils.distillation_utils import (
+    TeacherHead,
+    capture_hidden_states,
+    extract_lm_head,
+)
+from skyrl.backends.skyrl_train.utils.distillation_utils import (
+    kl_loss as distillation_kl,
 )
 from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
@@ -1693,20 +1695,20 @@ class RefWorkerBase(Worker):
         attention_mask = micro_batch["attention_mask"]
         pixel_values = micro_batch.get("pixel_values", None)
         image_grid_thw = micro_batch.get("image_grid_thw", None)
-        teacher_topk = self.cfg.algorithm.distillation.topk if self.cfg.algorithm.distillation.enabled else 0
         distillation = self.cfg.algorithm.distillation
-        # Full-vocab distillation ships hidden states instead of logits: hidden_size per token
-        # rather than vocab_size, projected back through the teacher's head on the policy rank.
-        capture = capture_hidden_states(self.model) if distillation.enabled and not teacher_topk else nullcontext()
+        teacher_topk = distillation.topk if distillation.enabled else None
+        ship_hidden = distillation.enabled and not teacher_topk and distillation.teacher_unembedding
+        ship_logits = distillation.enabled and not teacher_topk and not distillation.teacher_unembedding
+        capture = capture_hidden_states(self.model) if ship_hidden else nullcontext()
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"), capture as hidden:
             result = self.model(
                 sequences,
                 response_length,
                 attention_mask,
-                return_output=False,
+                return_output=ship_logits,
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
-                teacher_topk=teacher_topk,
+                teacher_topk=teacher_topk or 0,
             )
         tensors = {}
         # Align with the response window the loss slices out of the student's logits.
@@ -1715,6 +1717,9 @@ class RefWorkerBase(Worker):
             log_probs, topk_values, topk_indices = result
             tensors["teacher_values"] = topk_values[:, response].to("cpu")
             tensors["teacher_indices"] = topk_indices[:, response].to("cpu")
+        elif ship_logits:
+            log_probs, model_output = result
+            tensors["teacher_values"] = model_output["logits"][:, response].to("cpu")
         else:
             log_probs = result
             if hidden is not None:

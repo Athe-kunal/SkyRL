@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from skyrl.backends.skyrl_train.distillation.kl import kl_loss
+from skyrl.backends.skyrl_train.utils.distillation_utils import kl_loss
 
 
 @pytest.mark.parametrize("reverse", [True, False])

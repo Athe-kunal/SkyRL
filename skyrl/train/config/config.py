@@ -827,9 +827,12 @@ class DistillationConfig(BaseConfig):
     enabled: bool = False
     reverse: bool = True
     """``KL(student || teacher)`` when True, ``KL(teacher || student)`` when False."""
-    topk: int = 0
-    """Distill only the teacher's top-k tokens. ``0`` uses the full vocabulary, which ships teacher
-    hidden states and hosts the teacher's LM head on the policy ranks."""
+    topk: Optional[int] = None
+    """Distill only the teacher's top-k tokens. ``None`` uses the full vocabulary."""
+    teacher_unembedding: bool = False
+    """Full-vocab only. Host the teacher's unembedding (tied or not) on the policy ranks, so the ref
+    ships ``[batch, seq, hidden_size]`` and the projection to logits runs on the student rank --
+    ``vocab_size / hidden_size`` less on the wire. Without it the ref ships full logits."""
     coef: float = 1.0
     chunk_size: Optional[int] = None
     """Split the sequence into chunks of this size when computing the loss, to bound peak memory.

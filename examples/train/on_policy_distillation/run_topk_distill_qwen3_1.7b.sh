@@ -1,11 +1,9 @@
 set -x
 
-# Top-k on-policy distillation on the DAPO math dataset, with eval on AIME 2024.
-# Qwen-3-1.7B-Base as the student, an RL trained Qwen-3-4B as the teacher.
-#
-# Unlike run_on_policy_distill_*.sh, which estimates the per-token KL from the decoded token and
-# routes it through the reward, this distills the teacher's top-k distribution as a differentiable
-# loss: the gradient reaches k vocab entries per position instead of one.
+# On-policy distillation on the DAPO math dataset, with eval on AIME 2024. Qwen-3-1.7B-Base as the
+# student, an RL trained Qwen-3-4B as the teacher. Distills the teacher's distribution as a
+# differentiable KL, rather than the decoded token's KL through the reward as
+# run_on_policy_distill_*.sh does.
 #
 # bash examples/train/algorithms/dapo/prepare_dapo_data.sh
 # bash examples/train/on_policy_distillation/run_topk_distill_qwen3_1.7b.sh
@@ -18,8 +16,9 @@ LOGGER=wandb
 TEACHER_MODEL="$HOME/ckpts/dapo_qwen3_4b_base/global_step_90/"
 STUDENT_MODEL="Qwen/Qwen3-1.7B-Base"
 
-TOPK=64
-CHUNK_SIZE=null
+TOPK=64 # null distills the full vocabulary
+TEACHER_UNEMBEDDING=false # optional, full vocab only: ship hidden states instead of logits
+CHUNK_SIZE=null # bounds the teacher logits materialized at once; worth setting for full vocab
 REVERSE=true # KL(student || teacher); false gives KL(teacher || student)
 COEF=1.0
 
@@ -46,6 +45,7 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   trainer.algorithm.distillation.topk=$TOPK \
   trainer.algorithm.distillation.reverse=$REVERSE \
   trainer.algorithm.distillation.coef=$COEF \
+  trainer.algorithm.distillation.teacher_unembedding=$TEACHER_UNEMBEDDING \
   trainer.algorithm.distillation.chunk_size=$CHUNK_SIZE \
   trainer.algorithm.policy_loss_type=none \
   trainer.algorithm.use_kl_loss=false \

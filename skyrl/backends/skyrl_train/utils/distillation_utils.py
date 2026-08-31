@@ -1,15 +1,25 @@
-# Analytic KL between a student and a frozen teacher, for on-policy distillation -- either direction,
-# over the full vocab or a top-k subset of it. Replaces the sampled-token estimator
-# (``compute_approx_kl`` on the decoded token), whose gradient reaches only one logit per position.
+# On-policy distillation against a frozen teacher.
+#
+# `kl_loss` computes the KL analytically -- either direction, over the full vocab or a top-k subset
+# -- as a differentiable loss on the student's logits, replacing the sampled-token estimator
+# (`ppo_utils.compute_approx_kl`) whose gradient reaches only one logit per position.
+#
+# The rest supports the full-vocab path, where the teacher ships hidden states rather than logits
+# (hidden_size per token instead of vocab_size) and its unembedding is hosted on the policy rank.
 
-from typing import Callable, Optional
+from contextlib import contextmanager
+from typing import Callable, Iterator, List, Optional
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from jaxtyping import Float, Integer
 
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
+from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_base import (
+    materialize_full_tensor,
+)
 
 # Teacher-side width: the full vocab, or k when distilling only a top-k subset of it.
 TeacherValues = Float[torch.Tensor, "batch seq width"]
@@ -70,6 +80,8 @@ def kl_loss(
         return masked_mean(per_token_kl, mask)
 
     masked_sum = 0.0
+    # https://github.com/ChenmienTan/RL2/blob/main/RL2/utils/functions.py#L17
+    # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
     for start in range(0, student_logits.shape[1], chunk_size):
         sl = slice(start, start + chunk_size)
         idx_chunk = None if teacher_indices is None else teacher_indices[:, sl]
@@ -83,3 +95,50 @@ def kl_loss(
 
     denom = global_normalization_factor if global_normalization_factor is not None else mask.sum()
     return masked_sum / denom.clamp(min=1.0)
+
+
+def _find_output_embedding(model: nn.Module) -> nn.Module:
+    """The module projecting hidden states to vocab logits."""
+    # Take the first level that yields a head.
+    node, seen = model, set()
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        getter = getattr(node, "get_output_embeddings", None)
+        head = getter() if callable(getter) else None
+        if head is not None and getattr(head, "weight", None) is not None:
+            return head
+        node = getattr(node, "model", None) or getattr(node, "base_model", None)
+    raise ValueError(f"{type(model).__name__} exposes no output embeddings")
+
+
+def extract_lm_head(model: nn.Module) -> Float[torch.Tensor, "vocab hidden"]:
+    """Unembedding matrix as a detached CPU tensor. Handles tied embeddings; collective under FSDP."""
+    return materialize_full_tensor(_find_output_embedding(model).weight).detach().cpu()
+
+
+@contextmanager
+def capture_hidden_states(model: nn.Module) -> Iterator[List[torch.Tensor]]:
+    """Post-final-norm hidden states feeding the output embedding, one entry per forward call."""
+    captured: List[torch.Tensor] = []
+    handle = _find_output_embedding(model).register_forward_pre_hook(
+        lambda _module, args: captured.append(args[0].detach())
+    )
+    try:
+        yield captured
+    finally:
+        handle.remove()
+
+
+class TeacherHead(nn.Module):
+    """Kept beside the policy model, not as a submodule: the weight must stay out of the optimizer,
+    FSDP's sharding plan, and checkpoints."""
+
+    weight: Float[torch.Tensor, "vocab hidden"]
+
+    def __init__(self, weight: Float[torch.Tensor, "vocab hidden"], dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.register_buffer("weight", weight.detach().to(dtype), persistent=False)
+
+    @torch.no_grad()
+    def forward(self, hidden_states: Float[torch.Tensor, "batch seq hidden"]) -> Float[torch.Tensor, "batch seq vocab"]:
+        return F.linear(hidden_states.to(self.weight.dtype), self.weight)
